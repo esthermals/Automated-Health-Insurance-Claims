@@ -15,6 +15,13 @@
 (define-constant err-not-authorized (err u108))
 (define-constant err-policy-suspended (err u109))
 (define-constant err-diagnosis-expired (err u110))
+(define-constant err-emergency-claim-not-found (err u111))
+(define-constant err-insufficient-emergency-funds (err u112))
+(define-constant err-emergency-claim-expired (err u113))
+(define-constant err-already-approved (err u114))
+(define-constant err-emergency-claim-already-processed (err u115))
+(define-constant err-not-emergency-validator (err u116))
+(define-constant err-emergency-validator-exists (err u117))
 
 (define-data-var policy-counter uint u0)
 (define-data-var claim-counter uint u0)
@@ -64,7 +71,29 @@
     }
 )
 
+(define-map emergency-claims
+    { emergency-claim-id: uint }
+    {
+        claimant: principal,
+        amount: uint,
+        description-hash: (string-ascii 64),
+        submitted-block: uint,
+        expires-at: uint,
+        approvals: (list 10 principal),
+        processed: bool,
+        paid: bool
+    }
+)
+
+(define-map emergency-validators
+    { validator: principal }
+    { authorized: bool }
+)
+
 (define-data-var diagnosis-counter uint u0)
+(define-data-var emergency-claim-counter uint u0)
+(define-data-var emergency-fund-pool uint u0)
+(define-data-var required-emergency-approvals uint u2)
 
 (define-public (authorize-doctor (doctor principal) (specialization (string-ascii 50)))
     (begin
@@ -224,6 +253,118 @@
     )
 )
 
+(define-public (fund-emergency-pool (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set emergency-fund-pool (+ (var-get emergency-fund-pool) amount))
+        (ok amount)
+    )
+)
+
+(define-public (add-emergency-validator (validator principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-none (map-get? emergency-validators { validator: validator })) err-emergency-validator-exists)
+        (map-set emergency-validators { validator: validator } { authorized: true })
+        (ok true)
+    )
+)
+
+(define-public (remove-emergency-validator (validator principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-delete emergency-validators { validator: validator })
+        (ok true)
+    )
+)
+
+(define-public (submit-emergency-claim (amount uint) (description-hash (string-ascii 64)))
+    (let (
+        (emergency-claim-id (+ (var-get emergency-claim-counter) u1))
+        (expires-at (+ stacks-block-height u144))
+    )
+    (asserts! (<= amount (var-get emergency-fund-pool)) err-insufficient-emergency-funds)
+    (map-set emergency-claims
+        { emergency-claim-id: emergency-claim-id }
+        {
+            claimant: tx-sender,
+            amount: amount,
+            description-hash: description-hash,
+            submitted-block: stacks-block-height,
+            expires-at: expires-at,
+            approvals: (list),
+            processed: false,
+            paid: false
+        }
+    )
+    (var-set emergency-claim-counter emergency-claim-id)
+    (var-set emergency-fund-pool (- (var-get emergency-fund-pool) amount))
+    (ok emergency-claim-id)
+    )
+)
+
+(define-public (approve-emergency-claim (emergency-claim-id uint))
+    (let (
+        (claim (unwrap! (map-get? emergency-claims { emergency-claim-id: emergency-claim-id }) err-emergency-claim-not-found))
+        (validator-check (unwrap! (map-get? emergency-validators { validator: tx-sender }) err-not-emergency-validator))
+        (current-approvals (get approvals claim))
+        (already-approved (is-some (index-of current-approvals tx-sender)))
+    )
+    (asserts! (get authorized validator-check) err-not-emergency-validator)
+    (asserts! (not already-approved) err-already-approved)
+    (asserts! (not (get processed claim)) err-emergency-claim-already-processed)
+    (asserts! (<= stacks-block-height (get expires-at claim)) err-emergency-claim-expired)
+    
+    (let (
+        (new-approvals (unwrap! (as-max-len? (append current-approvals tx-sender) u10) err-insufficient-funds))
+        (approval-count (len new-approvals))
+    )
+    (map-set emergency-claims
+        { emergency-claim-id: emergency-claim-id }
+        (merge claim { approvals: new-approvals })
+    )
+    
+    (if (>= approval-count (var-get required-emergency-approvals))
+        (begin
+            (try! (as-contract (stx-transfer? (get amount claim) tx-sender (get claimant claim))))
+            (map-set emergency-claims
+                { emergency-claim-id: emergency-claim-id }
+                (merge claim { processed: true, paid: true, approvals: new-approvals })
+            )
+            (ok { approved: true, paid: true })
+        )
+        (ok { approved: true, paid: false })
+    )
+    )
+    )
+)
+
+(define-public (expire-emergency-claim (emergency-claim-id uint))
+    (let (
+        (claim (unwrap! (map-get? emergency-claims { emergency-claim-id: emergency-claim-id }) err-emergency-claim-not-found))
+    )
+    (asserts! (> stacks-block-height (get expires-at claim)) err-emergency-claim-expired)
+    (asserts! (not (get processed claim)) err-emergency-claim-already-processed)
+    
+    (map-set emergency-claims
+        { emergency-claim-id: emergency-claim-id }
+        (merge claim { processed: true, paid: false })
+    )
+    (var-set emergency-fund-pool (+ (var-get emergency-fund-pool) (get amount claim)))
+    (ok true)
+    )
+)
+
+(define-public (set-emergency-approval-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (and (> new-threshold u0) (<= new-threshold u10)) err-insufficient-funds)
+        (var-set required-emergency-approvals new-threshold)
+        (ok new-threshold)
+    )
+)
+
 (define-read-only (get-policy (policy-id uint))
     (map-get? policies { policy-id: policy-id })
 )
@@ -273,5 +414,36 @@
             (<= stacks-block-height (get valid-until diagnosis))
         )
         false
+    )
+)
+
+(define-read-only (get-emergency-claim (emergency-claim-id uint))
+    (map-get? emergency-claims { emergency-claim-id: emergency-claim-id })
+)
+
+(define-read-only (is-emergency-validator (validator principal))
+    (match (map-get? emergency-validators { validator: validator })
+        validator-info (get authorized validator-info)
+        false
+    )
+)
+
+(define-read-only (get-emergency-fund-status)
+    (ok {
+        total-pool: (var-get emergency-fund-pool),
+        required-approvals: (var-get required-emergency-approvals),
+        total-emergency-claims: (var-get emergency-claim-counter)
+    })
+)
+
+(define-read-only (get-emergency-claim-approvals (emergency-claim-id uint))
+    (match (map-get? emergency-claims { emergency-claim-id: emergency-claim-id })
+        claim {
+            approvals: (get approvals claim),
+            approval-count: (len (get approvals claim)),
+            required-count: (var-get required-emergency-approvals),
+            is-approved: (>= (len (get approvals claim)) (var-get required-emergency-approvals))
+        }
+        { approvals: (list), approval-count: u0, required-count: u0, is-approved: false }
     )
 )
