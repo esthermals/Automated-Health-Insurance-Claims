@@ -22,6 +22,8 @@
 (define-constant err-emergency-claim-already-processed (err u115))
 (define-constant err-not-emergency-validator (err u116))
 (define-constant err-emergency-validator-exists (err u117))
+(define-constant err-invalid-deductible (err u118))
+(define-constant err-invalid-copay (err u119))
 
 (define-data-var policy-counter uint u0)
 (define-data-var claim-counter uint u0)
@@ -37,7 +39,10 @@
         start-block: uint,
         end-block: uint,
         active: bool,
-        claims-made: uint
+        claims-made: uint,
+        deductible: uint,
+        copay-percentage: uint,
+        deductible-accumulator: uint
     }
 )
 
@@ -94,6 +99,7 @@
 (define-data-var emergency-claim-counter uint u0)
 (define-data-var emergency-fund-pool uint u0)
 (define-data-var required-emergency-approvals uint u2)
+(define-data-var total-deductibles-collected uint u0)
 
 (define-public (authorize-doctor (doctor principal) (specialization (string-ascii 50)))
     (begin
@@ -127,7 +133,10 @@
             start-block: start-block,
             end-block: end-block,
             active: true,
-            claims-made: u0
+            claims-made: u0,
+            deductible: u0,
+            copay-percentage: u0,
+            deductible-accumulator: u0
         }
     )
     (var-set policy-counter policy-id)
@@ -189,24 +198,35 @@
         (claim (unwrap! (map-get? claims { claim-id: claim-id }) err-claim-not-found))
         (policy (unwrap! (map-get? policies { policy-id: (get policy-id claim) }) err-policy-not-found))
         (diagnosis (unwrap! (map-get? diagnoses { diagnosis-id: diagnosis-id }) err-invalid-diagnosis))
+        (claim-amount (get amount claim))
+        (deductible (get deductible policy))
+        (copay-pct (get copay-percentage policy))
+        (deductible-accumulator (get deductible-accumulator policy))
+        (remaining-deductible (if (>= deductible-accumulator deductible) u0 (- deductible deductible-accumulator)))
+        (deductible-owed (if (> claim-amount remaining-deductible) remaining-deductible claim-amount))
+        (amount-after-deductible (- claim-amount deductible-owed))
+        (copay-amount (/ (* amount-after-deductible copay-pct) u100))
+        (insurance-payout (- amount-after-deductible copay-amount))
+        (new-accumulator (+ deductible-accumulator deductible-owed))
     )
     (asserts! (not (get processed claim)) err-claim-already-processed)
-    (asserts! (>= (stx-get-balance (as-contract tx-sender)) (get amount claim)) err-insufficient-funds)
+    (asserts! (>= (stx-get-balance (as-contract tx-sender)) insurance-payout) err-insufficient-funds)
     (asserts! (is-eq (get patient diagnosis) (get claimant claim)) err-not-authorized)
     (asserts! (is-eq (get diagnosis-code diagnosis) (get diagnosis-code claim)) err-invalid-diagnosis)
     (asserts! (<= stacks-block-height (get valid-until diagnosis)) err-diagnosis-expired)
     
-    (try! (as-contract (stx-transfer? (get amount claim) tx-sender (get claimant claim))))
+    (try! (as-contract (stx-transfer? insurance-payout tx-sender (get claimant claim))))
     (map-set claims
         { claim-id: claim-id }
         (merge claim { processed: true, approved: true, paid-block: (some stacks-block-height) })
     )
     (map-set policies
         { policy-id: (get policy-id claim) }
-        (merge policy { claims-made: (+ (get claims-made policy) u1) })
+        (merge policy { claims-made: (+ (get claims-made policy) u1), deductible-accumulator: new-accumulator })
     )
-    (var-set total-claims-paid (+ (var-get total-claims-paid) (get amount claim)))
-    (ok true)
+    (var-set total-claims-paid (+ (var-get total-claims-paid) insurance-payout))
+    (var-set total-deductibles-collected (+ (var-get total-deductibles-collected) deductible-owed))
+    (ok { total-claim: claim-amount, deductible-charge: deductible-owed, copay-charge: copay-amount, insurance-pays: insurance-payout })
     )
 )
 
@@ -365,6 +385,35 @@
     )
 )
 
+(define-public (configure-deductible (policy-id uint) (deductible-amount uint) (copay-pct uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= copay-pct u100) err-invalid-copay)
+        (asserts! (is-some (map-get? policies { policy-id: policy-id })) err-policy-not-found)
+        (map-set policies
+            { policy-id: policy-id }
+            (merge (unwrap-panic (map-get? policies { policy-id: policy-id }))
+                { deductible: deductible-amount, copay-percentage: copay-pct }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (reset-deductible-accumulator (policy-id uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-some (map-get? policies { policy-id: policy-id })) err-policy-not-found)
+        (map-set policies
+            { policy-id: policy-id }
+            (merge (unwrap-panic (map-get? policies { policy-id: policy-id }))
+                { deductible-accumulator: u0 }
+            )
+        )
+        (ok true)
+    )
+)
+
 (define-read-only (get-policy (policy-id uint))
     (map-get? policies { policy-id: policy-id })
 )
@@ -446,4 +495,46 @@
         }
         { approvals: (list), approval-count: u0, required-count: u0, is-approved: false }
     )
+)
+
+(define-read-only (calculate-claim-breakdown (policy-id uint) (claim-amount uint))
+    (let (
+        (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-policy-not-found))
+        (deductible (get deductible policy))
+        (copay-pct (get copay-percentage policy))
+        (deductible-accumulator (get deductible-accumulator policy))
+        (remaining-deductible (if (>= deductible-accumulator deductible) u0 (- deductible deductible-accumulator)))
+        (deductible-owed (if (> claim-amount remaining-deductible) remaining-deductible claim-amount))
+        (amount-after-deductible (- claim-amount deductible-owed))
+        (copay-amount (/ (* amount-after-deductible copay-pct) u100))
+        (insurance-payout (- amount-after-deductible copay-amount))
+    )
+        (ok {
+            total-claim: claim-amount,
+            deductible-charge: deductible-owed,
+            copay-charge: copay-amount,
+            insurance-pays: insurance-payout,
+            remaining-annual-deductible: (- remaining-deductible deductible-owed)
+        })
+    )
+)
+
+(define-read-only (get-policy-deductible-info (policy-id uint))
+    (let (
+        (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-policy-not-found))
+    )
+        (ok {
+            deductible: (get deductible policy),
+            copay-percentage: (get copay-percentage policy),
+            deductible-accumulator: (get deductible-accumulator policy),
+            remaining-deductible: (if (>= (get deductible-accumulator policy) (get deductible policy))
+                u0
+                (- (get deductible policy) (get deductible-accumulator policy))
+            )
+        })
+    )
+)
+
+(define-read-only (get-total-deductibles-collected)
+    (ok (var-get total-deductibles-collected))
 )
